@@ -1,0 +1,319 @@
+#!/bin/bash
+
+################################################################################
+# Script: Moodle 5.0+ Automatic Installation on Debian 12 (Bookworm)
+# Usage:  sudo bash install_moodle.sh
+# License: MIT
+################################################################################
+
+set -e  # Exit on any error
+
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Output functions
+info() { echo -e "${GREEN}[OK]${NC} $1"; }
+error() { echo -e "${RED}[FAIL]${NC} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+step() { echo -e "\n${BLUE}>>${NC} $1"; }
+
+# Check root privileges
+if [[ $EUID -ne 0 ]]; then
+    error "This script must be run as root (use sudo)"
+    exit 1
+fi
+
+clear
+echo "=========================================================================="
+echo "   Moodle 5.0+ Installation Script for Debian 12 (Bookworm)"
+echo "=========================================================================="
+echo ""
+
+# Get user input
+DEFAULT_IP=$(ip route get 1 | awk '{print $NF;exit}')
+read -p "Enter server domain or IP address [$DEFAULT_IP]: " SERVER_NAME
+SERVER_NAME=${SERVER_NAME:-$DEFAULT_IP}
+
+read -p "Enter MySQL root password: " MYSQL_ROOT_PASSWORD
+
+read -p "Enter Moodle database username [moodleuser]: " MOODLE_DB_USER
+MOODLE_DB_USER=${MOODLE_DB_USER:-moodleuser}
+
+read -sp "Enter password for database user $MOODLE_DB_USER: " MOODLE_DB_PASSWORD
+echo ""
+
+read -p "Enter full site name [Learning Management System]: " SITE_FULLNAME
+SITE_FULLNAME=${SITE_FULLNAME:-"Learning Management System"}
+
+read -p "Enter short site name [Moodle]: " SITE_SHORTNAME
+SITE_SHORTNAME=${SITE_SHORTNAME:-"Moodle"}
+
+read -p "Enter admin email address [admin@example.com]: " ADMIN_EMAIL
+ADMIN_EMAIL=${ADMIN_EMAIL:-"admin@example.com"}
+
+read -sp "Enter Moodle admin password (minimum 8 characters): " ADMIN_PASSWORD
+echo ""
+
+# Validate admin password length
+if [[ ${#ADMIN_PASSWORD} -lt 8 ]]; then
+    error "Admin password must be at least 8 characters long"
+    exit 1
+fi
+
+echo ""
+info "Starting Moodle 5.0+ installation..."
+echo "=========================================================================="
+
+################################################################################
+# Step 1: System Update
+################################################################################
+step "Step 1/12: Updating system packages..."
+apt update && apt upgrade -y
+apt install -y curl wget gnupg2 software-properties-common lsb-release ca-certificates
+
+################################################################################
+# Step 2: Install Apache and PHP 8.2
+################################################################################
+step "Step 2/12: Installing Apache and PHP 8.2 with required modules..."
+apt install -y apache2 \
+    php8.2 \
+    libapache2-mod-php8.2 \
+    php8.2-cli \
+    php8.2-common \
+    php8.2-mysql \
+    php8.2-zip \
+    php8.2-gd \
+    php8.2-mbstring \
+    php8.2-curl \
+    php8.2-xml \
+    php8.2-bcmath \
+    php8.2-intl \
+    php8.2-soap \
+    php8.2-xmlrpc \
+    php8.2-tidy
+
+info "Apache and PHP 8.2 installed"
+
+################################################################################
+# Step 3: Install MariaDB
+################################################################################
+step "Step 3/12: Installing MariaDB server..."
+apt install -y mariadb-server mariadb-client
+
+systemctl start mariadb
+systemctl enable mariadb
+
+info "MariaDB installed and running"
+
+################################################################################
+# Step 4: Configure PHP for Moodle
+################################################################################
+step "Step 4/12: Configuring PHP for Moodle requirements..."
+PHP_INI="/etc/php/8.2/apache2/php.ini"
+
+sed -i "s/^memory_limit = .*/memory_limit = 512M/" $PHP_INI
+sed -i "s/^upload_max_filesize = .*/upload_max_filesize = 100M/" $PHP_INI
+sed -i "s/^post_max_size = .*/post_max_size = 100M/" $PHP_INI
+sed -i "s/^max_execution_time = .*/max_execution_time = 300/" $PHP_INI
+sed -i "s/^max_input_vars = .*/max_input_vars = 5000/" $PHP_INI
+sed -i "s/^;date.timezone =.*/date.timezone = UTC/" $PHP_INI
+
+info "PHP configuration completed"
+
+################################################################################
+# Step 5: Configure MariaDB for Moodle 5
+################################################################################
+step "Step 5/12: Configuring MariaDB for Moodle 5..."
+
+cat >> /etc/mysql/mariadb.conf.d/50-server.cnf << EOF
+
+# Moodle 5 specific settings
+innodb_file_format = Barracuda
+default_storage_engine = innodb
+innodb_large_prefix = 1
+innodb_file_per_table = 1
+innodb_buffer_pool_size = 256M
+EOF
+
+systemctl restart mariadb
+
+# Secure MariaDB installation
+mysql -e "SET PASSWORD FOR 'root'@'localhost' = PASSWORD('$MYSQL_ROOT_PASSWORD');" 2>/dev/null || true
+mysql -e "DELETE FROM mysql.user WHERE User='';" 2>/dev/null || true
+mysql -e "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');" 2>/dev/null || true
+mysql -e "DROP DATABASE IF EXISTS test;" 2>/dev/null || true
+mysql -e "DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';" 2>/dev/null || true
+mysql -e "FLUSH PRIVILEGES;" 2>/dev/null || true
+
+info "MariaDB configured and secured"
+
+################################################################################
+# Step 6: Create Moodle Database and User
+################################################################################
+step "Step 6/12: Creating Moodle database and user..."
+
+mysql -u root -p$MYSQL_ROOT_PASSWORD << EOF
+CREATE DATABASE IF NOT EXISTS moodle DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '$MOODLE_DB_USER'@'localhost' IDENTIFIED BY '$MOODLE_DB_PASSWORD';
+GRANT ALL PRIVILEGES ON moodle.* TO '$MOODLE_DB_USER'@'localhost';
+FLUSH PRIVILEGES;
+EOF
+
+info "Database 'moodle' and user '$MOODLE_DB_USER' created"
+
+################################################################################
+# Step 7: Download Moodle 5
+################################################################################
+step "Step 7/12: Downloading Moodle 5 (latest stable version)..."
+
+cd /var/www/
+
+wget -q --show-progress https://download.moodle.org/download.php/direct/stable500/moodle-latest-500.tgz
+
+tar -xzf moodle-latest-500.tgz
+rm -f moodle-latest-500.tgz
+
+info "Moodle 5 extracted to /var/www/moodle"
+
+################################################################################
+# Step 8: Create Moodle Data Directory
+################################################################################
+step "Step 8/12: Creating Moodle data directory..."
+
+mkdir -p /var/moodledata
+chown -R www-data:www-data /var/moodledata
+chmod -R 770 /var/moodledata
+
+info "Data directory created at /var/moodledata"
+
+################################################################################
+# Step 9: Set File Permissions
+################################################################################
+step "Step 9/12: Setting correct file permissions..."
+
+chown -R www-data:www-data /var/www/moodle
+
+find /var/www/moodle -type d -exec chmod 755 {} \;
+find /var/www/moodle -type f -exec chmod 644 {} \;
+
+chmod 777 /var/www/moodle/admin/cli/
+
+info "File permissions configured"
+
+################################################################################
+# Step 10: Configure Apache Virtual Host
+################################################################################
+step "Step 10/12: Configuring Apache virtual host..."
+
+cat > /etc/apache2/sites-available/moodle.conf << EOF
+<VirtualHost *:80>
+    ServerAdmin webmaster@localhost
+    ServerName $SERVER_NAME
+    DocumentRoot /var/www/moodle
+
+    <Directory /var/www/moodle>
+        Options FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    ErrorLog \${APACHE_LOG_DIR}/moodle_error.log
+    CustomLog \${APACHE_LOG_DIR}/moodle_access.log combined
+</VirtualHost>
+EOF
+
+a2dissite 000-default.conf 2>/dev/null || true
+a2ensite moodle.conf
+
+a2enmod rewrite
+a2enmod headers
+
+systemctl restart apache2
+
+info "Apache virtual host configured"
+
+################################################################################
+# Step 11: Automated Moodle Installation via CLI
+################################################################################
+step "Step 11/12: Running Moodle CLI installation..."
+
+cd /var/www/moodle
+
+sudo -u www-data php admin/cli/install.php \
+    --lang=en \
+    --chmod=2777 \
+    --wwwroot="http://$SERVER_NAME" \
+    --dataroot="/var/moodledata" \
+    --dbtype="mariadb" \
+    --dbhost="localhost" \
+    --dbname="moodle" \
+    --dbuser="$MOODLE_DB_USER" \
+    --dbpass="$MOODLE_DB_PASSWORD" \
+    --fullname="$SITE_FULLNAME" \
+    --shortname="$SITE_SHORTNAME" \
+    --adminuser="admin" \
+    --adminpass="$ADMIN_PASSWORD" \
+    --adminemail="$ADMIN_EMAIL" \
+    --non-interactive \
+    --agree-license
+
+info "Moodle installation completed successfully"
+
+chmod 755 /var/www/moodle/admin/cli/
+
+################################################################################
+# Step 12: Configure Cron
+################################################################################
+step "Step 12/12: Configuring Cron for Moodle background tasks..."
+
+(crontab -u www-data -l 2>/dev/null; echo "* * * * * /usr/bin/php /var/www/moodle/admin/cli/cron.php > /dev/null") | crontab -u www-data -
+
+systemctl restart cron
+
+info "Cron configured to run every minute"
+
+################################################################################
+# Optional: Configure UFW Firewall
+################################################################################
+step "Configuring UFW firewall..."
+
+apt install -y ufw
+ufw allow 22/tcp 2>/dev/null || true
+ufw allow 80/tcp 2>/dev/null || true
+ufw allow 443/tcp 2>/dev/null || true
+echo "y" | ufw enable 2>/dev/null || true
+
+info "Firewall configured (ports 22, 80, 443 open)"
+
+################################################################################
+# Installation Complete
+################################################################################
+echo ""
+echo "=========================================================================="
+echo "Moodle 5.0+ Installation Completed Successfully"
+echo "=========================================================================="
+echo ""
+echo "Login Information:"
+echo "   Website URL: http://$SERVER_NAME"
+echo "   Admin Username: admin"
+echo "   Admin Password: $ADMIN_PASSWORD"
+echo ""
+echo "Directories:"
+echo "   Installation: /var/www/moodle"
+echo "   Data: /var/moodledata"
+echo ""
+echo "Database Information:"
+echo "   Database Name: moodle"
+echo "   Database User: $MOODLE_DB_USER"
+echo ""
+echo "Important Notes:"
+echo "   1. HTTPS/SSL is strongly recommended for production use"
+echo "   2. To enable HTTPS, run: sudo apt install certbot python3-certbot-apache"
+echo "   3. Then: sudo certbot --apache -d $SERVER_NAME"
+echo "   4. Configure SMTP email settings in Moodle admin panel"
+echo ""
+echo "=========================================================================="

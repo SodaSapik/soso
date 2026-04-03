@@ -1,0 +1,53 @@
+#!/bin/bash
+
+set -e
+
+echo "Stopping systemd-resolved..."
+systemctl stop systemd-resolved 2>/dev/null || true
+systemctl disable systemd-resolved 2>/dev/null || true
+
+echo "Stopping dnsmasq..."
+systemctl stop dnsmasq 2>/dev/null || true
+systemctl disable dnsmasq 2>/dev/null || true
+
+echo "Removing dnsmasq package..."
+apt-get purge -y dnsmasq dnsmasq-base 2>/dev/null || true
+apt-get autoremove -y
+
+echo "Removing dnsmasq configs..."
+rm -rf /etc/dnsmasq.conf
+rm -rf /etc/dnsmasq.d
+rm -rf /var/lib/misc/dnsmasq.*
+
+echo "Removing resolv.conf..."
+rm -f /etc/resolv.conf
+
+echo "Creating empty resolv.conf..."
+touch /etc/resolv.conf
+chmod 644 /etc/resolv.conf
+
+echo "Cleaning DNS from /etc/network/interfaces..."
+if [ -f /etc/network/interfaces ]; then
+    sed -i '/dns-nameservers/d' /etc/network/interfaces
+    sed -i '/dns-search/d' /etc/network/interfaces
+fi
+
+echo "Cleaning DNS from dhclient config..."
+if [ -f /etc/dhcp/dhclient.conf ]; then
+    sed -i '/domain-name-servers/d' /etc/dhcp/dhclient.conf
+fi
+
+echo "Cleaning DNS from NetworkManager configs..."
+if [ -d /etc/NetworkManager/system-connections ]; then
+    for file in /etc/NetworkManager/system-connections/*; do
+        sed -i '/dns=/d' "$file" 2>/dev/null || true
+    done
+fi
+
+echo "Restarting networking..."
+systemctl restart networking 2>/dev/null || true
+
+echo "DNS configuration and dnsmasq removed."
+
+echo "Current resolv.conf:"
+cat /etc/resolv.conf
